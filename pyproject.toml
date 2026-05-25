@@ -33,7 +33,7 @@ dev = [
 
 [project.entry-points."pytest11"]
 # This registers the plugin with pytest
-# gz_sim = "pytest_gz.plugin"
+pytest_ros = "pytest_ros.plugin"
 
 [tool.hatch.version]
 source = "vcs"
