@@ -16,7 +16,9 @@ if RCLPY_AVAILABLE:
     from rclpy.executors import SingleThreadedExecutor
 
 from contextlib import contextmanager
-    
+
+import logging
+   
 
 
 class MultiProcessManager:
@@ -122,14 +124,22 @@ class EpisodeMonitor:
 
     def __init__(
         self,
-        node_name: str,
+        name: str,
+        timeout: float | None = None
     ):
         
+        self.name = name
+        self._logger = logging.getLogger(f'EpisodeMonitor.{self.name}')
+
         self._conditions = {} # dict of condition name to its 'value' (True/False/None) and 'interface' (e.g. subscriber or service client)
         self._statuses = {}
         
+        # Monitor start time
+        self._start_time = time.time()
+        self._timeout = timeout
+
         # Initialize the internal ROS 2 node
-        self.node = Node(node_name)
+        self.node = Node(name)
 
         # Setup threading and execution infrastructure
         self._stop_event = threading.Event()
@@ -144,10 +154,43 @@ class EpisodeMonitor:
         if not self._is_running.wait(timeout=2.0):
             raise RuntimeError("ROS 2 background executor failed to start.")
         
-        # Create default statuses 
-        self.register_status(status_name='timeout', conditions=[], trigger='ANY') # Evaluates to True if any timeouts occur
+        # Create default statuses
+        self.register_condition(condition_name='episode_timeout')
+        self.register_status(status_name='timeout', conditions=['episode_timeout'], trigger='ANY') # Evaluates to True if any timeouts occur
+        
+        
+    def set_timeout(self, timeout: float):
+        """Sets a new timeout for the episode. If the timeout is breached, the 'timeout' status will be triggered."""
+        self._start_time = time.time()  # Reset start time whenever timeout is set
+        self._timeout = timeout
+        self._logger.info(f"Episode timeout set to {timeout} seconds from time {self._start_time}.")
 
-    def register_condition(self, condition_name, topic_name, msg_type, value_check=None):
+
+    def register_condition(self, condition_name):
+        """
+        Registers a simple condition that can be manually set to True or False.
+
+        Parameters:
+            condition_name (str): The name of the condition.
+        """
+        self._conditions[condition_name] = {'value': None, 'interface': 'manual'}  # Initialize condition value as None
+
+    def get_condition(self, condition_name):
+        """
+        Retrieves the current value of a condition.
+
+        Parameters:
+            condition_name (str): The name of the condition.
+
+        Returns:
+            bool: The current value of the condition, or None if the condition is not registered.
+        """
+        condition_info = self._conditions.get(condition_name)
+        if condition_info:
+            return condition_info['value']
+        return None
+
+    def register_topic_condition(self, condition_name, topic_name, msg_type, value_check=None):
         """
         Registers a condition based on a ROS topic. 
         Conditions can be True, False, or None (not yet received).
@@ -167,21 +210,7 @@ class EpisodeMonitor:
         )
 
     
-    def get_condition(self, condition_name):
-        """
-        Retrieves the current value of a condition.
 
-        Parameters:
-            condition_name (str): The name of the condition.
-
-        Returns:
-            bool: The current value of the condition, or None if the condition is not registered.
-        """
-        condition_info = self._conditions.get(condition_name)
-        if condition_info:
-            return condition_info['value']
-        return None
-    
     def register_service_condition(self, 
         condition_name, 
         service_name, 
@@ -190,7 +219,8 @@ class EpisodeMonitor:
         value_check=None,
         period: float = 1.0,
         start_on_status: str = None,
-        timeout: float = None
+        timeout: float = None,
+        timeout_is_fatal: bool = False
     ):
         """
         Registers a condition based on a ROS service.
@@ -204,11 +234,13 @@ class EpisodeMonitor:
             period (float): How often to call the service in seconds.
             start_on_status (str, optional): If provided, the service calls will only start once this status is triggered.
             timeout (float, optional): Maximum time to keep trying the service call before giving up. If None, it will keep trying indefinitely.
+            timeout_is_fatal (bool, optional): If True, the timeout will be reported as an episode timeout.
         """
         self._conditions[condition_name] = {'value': None, 'interface': None}  # Initialize condition value as None
         if timeout is not None:
             self._conditions[f'{condition_name}_timeout'] = {'value': False, 'interface': None} 
-            self.add_condition_to_status('timeout', f'{condition_name}_timeout')
+            if timeout_is_fatal:
+                self.add_condition_to_status('timeout', f'{condition_name}_timeout')
         self._conditions[condition_name]['interface'] = self._setup_client(
             condition_name=condition_name,
             service_name=service_name,
@@ -239,6 +271,7 @@ class EpisodeMonitor:
         }
         self._conditions.setdefault(status_name, {'value': None, 'interface': 'status'})  # Ensure the status itself is also a condition for potential nesting
 
+
     def add_condition_to_status(self, status_name, condition_name):
         """
         Dynamically adds a condition to an existing status.
@@ -263,6 +296,9 @@ class EpisodeMonitor:
         if not status:
             self.node.get_logger().warning(f"Status '{status_name}' is not registered.")
             return False
+
+        if len(status['conditions']) == 0:
+            return False  # A status with no conditions is considered always False
 
         # If a condition is actually another status, we need to evaluate it recursively by calling get_status on it.
         # TODO: This could be optimized with memoization if we expect deep nesting, but for now we assume simple cases.
@@ -292,6 +328,7 @@ class EpisodeMonitor:
         Updates the value of a condition and checks if the associated status is triggered.
         """
         self._conditions[condition_name]['value'] = value
+        self._logger.info(f"Condition '{condition_name}' updated: {value}.")
 
     def _setup_subscription(self, condition_name, topic_name, msg_type, value_check=None):
         """
@@ -400,8 +437,14 @@ class EpisodeMonitor:
         while rclpy.ok() and not self._stop_event.is_set():
             # Safely process pending callbacks on the internal node
             self._executor.spin_once(timeout_sec=0.0)
-            
-        
+
+            # Check for episode timeout
+            if self._timeout is not None and (time.time() - self._start_time) > self._timeout:
+                self.node.get_logger().error(f"Episode timeout of {self._timeout}s exceeded.")
+                self._update_condition('episode_timeout', True)
+
+                break
+                
 
     def shutdown(self):
         """
@@ -436,7 +479,7 @@ def ros_monitor():
     """Fixture to provide an EpisodeMonitor instance for monitoring test conditions."""
     rclpy.init()
     
-    monitor = EpisodeMonitor(node_name="episode_monitor")
+    monitor = EpisodeMonitor(name="episode_monitor")
 
     yield monitor
 
