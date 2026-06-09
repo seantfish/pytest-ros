@@ -1,16 +1,40 @@
-class _VideoRecorder:
+import cv2
+import logging
+import numpy as np
+import threading
+
+from pytest_ros import RCLPY_AVAILABLE
+if RCLPY_AVAILABLE:
+    import rclpy
+    from rclpy.node import Node
+    from sensor_msgs.msg import Image
+
+logger = logging.getLogger(__name__)
+
+class VideoRecorder:
     """
+    This utility enables direct recording of ROS image topics to MP4 files for assessment purposes.
+    It is not intended for logging but rather for quick visual verification of test runs.
+    
     Subscribes to a ROS image topic and writes frames to an MP4 file.
 
     Usage::
-
-        recorder = _VideoRecorder(node, CAMERA_TOPIC, "/tmp/sim_logs/run.mp4")
+        recorder = VideoRecorder(node, CAMERA_TOPIC, "/tmp/sim_logs/run.mp4")
         recorder.start()
         # ... run test ...
         recorder.stop()   # flushes and closes the file
     """
 
-    def __init__(self, node, topic: str, output_path: str, fps: int = VIDEO_FPS):
+    def __init__(
+            self, 
+            node, 
+            topic: str, 
+            output_path: str, 
+            fps: int = 12
+        ):
+        if type(node) is str:
+            rclpy.init()
+            node = rclpy.create_node(node)
         self._node = node
         self._output_path = output_path
         self._fps = fps
